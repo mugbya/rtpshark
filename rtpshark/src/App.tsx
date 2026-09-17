@@ -15,11 +15,14 @@ const ROLES = [
 const fmtTime = (t: number) =>
   new Date(t * 1000).toLocaleString("zh-CN", { hour12: false });
 
+// 通话完整性徽章：状态值与 callDetector.assessCallCompleteness（Python
+// assess_call_completeness）一致——complete / truncated_head / truncated_tail /
+// truncated_both；文案对照 Python STATUS_LABELS
 const INTEGRITY_BADGE: Record<string, { cls: string; text: string }> = {
   complete: { cls: "green", text: "✅ 完整" },
-  missing_start: { cls: "yellow", text: "⚠️ 缺开头" },
-  missing_end: { cls: "yellow", text: "⚠️ 缺结尾" },
-  missing_both: { cls: "red", text: "❌ 首尾都不完整" },
+  truncated_head: { cls: "yellow", text: "⚠️ 缺开头（抓包时通话已在进行）" },
+  truncated_tail: { cls: "yellow", text: "⚠️ 缺结尾（抓包结束时通话未结束）" },
+  truncated_both: { cls: "red", text: "❌ 首尾都不完整" },
 };
 
 function App() {
@@ -221,9 +224,10 @@ function App() {
               <p className="muted small">未检出通话（可能缺少 SIP 信令或媒体流太少）。</p>
             )}
             {calls.map((c, idx) => {
-              const badge = INTEGRITY_BADGE[
-                overallIntegrity(c)
-              ] || { cls: "gray", text: "—" };
+              const badge = INTEGRITY_BADGE[c.integrity?.status ?? "complete"] || {
+                cls: "gray",
+                text: "—",
+              };
               return (
                 <div key={c.callId || idx} className="call-card">
                   <div>
@@ -238,7 +242,7 @@ function App() {
                     <summary className="small muted">判断依据与信令流程</summary>
                     {c.integrity && Object.entries(c.integrity.perFile ?? {}).map(([role, v]) => (
                       <div key={role} className="small mt-2">
-                        <strong>{role}</strong>（{v.status}）：
+                        <strong>{role}</strong>（{INTEGRITY_BADGE[v.status]?.text ?? v.status}）：
                         {v.reasons?.length ? v.reasons.join("；") : "—"}
                       </div>
                     ))}
@@ -401,16 +405,6 @@ function App() {
       </p>
     </main>
   );
-}
-
-function overallIntegrity(c: CallInfo): string {
-  const entries = Object.values(c.integrity?.perFile ?? {});
-  if (!entries.length) return "complete";
-  if (entries.every((e) => e.status === "complete")) return "complete";
-  if (entries.some((e) => e.status === "missing_both")) return "missing_both";
-  if (entries.some((e) => e.status === "missing_start")) return "missing_start";
-  if (entries.some((e) => e.status === "missing_end")) return "missing_end";
-  return "complete";
 }
 
 // 阶梯图体积可观，懒加载
