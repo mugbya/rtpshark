@@ -1,11 +1,15 @@
 // SIP 信令阶梯图 —— 渲染 callDetector.buildSipFlows 产出的去重信令流（SipFlowItem），
-// 并对齐 Python Web 版的三类标注：
-//   1) RTP 媒体开始/结束标线（成对插在首条 BYE 行之前，无 BYE 按媒体结束时间兜底）
-//   2) 两腿协商编码行（主叫/被叫各一行，锚在该腿应答行之后；无 per-leg 数据时
-//      回退为单行 negotiatedCodecs 汇总）
-//   3) FS 媒体处理（转码）判定行（固定在 RTP 开始标线之前）
+// 并对齐 Python Web 版的标注体系，编码部分按「谁支持什么 → 最终定了什么」展示：
+//   1) 主叫支持的编码（主叫腿 SDP offer 列表）
+//   2) FS 支持的编码（FS 发出的 SDP：主叫腿应答 + 被叫腿 offer）
+//   3) 被叫支持的编码（被叫腿 SDP 应答列表）
+//   4) 最终协商编码（两腿应答合并：一致取交集顺序，两腿不同则分腿列出）
+//   5) RTP 媒体开始/结束标线（成对插在首条 BYE 行之前，无 BYE 按媒体结束时间兜底）
+//   6) FS 媒体处理（转码）判定行
+// 腿→角色映射来自 negotiatedPerLeg（caller 腿 offerer=主叫/answerer=FS，
+// callee 腿 offerer=FS/answerer=被叫），无需依赖 serverIp。
 import type { CallInfo } from "../analyzer/types";
-import type { SipFlowItem, SipFlowKind } from "../analyzer/callDetector";
+import type { NegotiatedLeg, SipFlowItem, SipFlowKind } from "../analyzer/callDetector";
 
 const KIND_COLORS: Record<SipFlowKind, string> = {
   request: "#2563eb", // 请求（INVITE/ACK/BYE…）蓝色
@@ -15,12 +19,31 @@ const KIND_COLORS: Record<SipFlowKind, string> = {
 };
 
 type Chip = { icon: string; text: string };
+type Party = "caller" | "fsCaller" | "fsCallee" | "callee";
+const PARTY_NAMES: Record<Party, string> = {
+  caller: "主叫端支持",
+  fsCaller: "FS 与主叫协商",
+  fsCallee: "FS 与被叫协商",
+  callee: "被叫端支持",
+};
 
 function codecChips(leg: { audio?: string[]; video?: string[] }): Chip[] {
   const chips: Chip[] = [];
   if (leg.audio?.length) chips.push({ icon: "🎵", text: `音频 ${leg.audio.join(" / ")}` });
   if (leg.video?.length) chips.push({ icon: "🎬", text: `视频 ${leg.video.join(" / ")}` });
   return chips;
+}
+
+/** 有序去重合并 SDP 编码列表 */
+function mergeCodecs(
+  acc: { audio: string[]; video: string[] },
+  add: { audio?: string[]; video?: string[] },
+): void {
+  for (const k of ["audio", "video"] as const) {
+    for (const c of add[k] ?? []) {
+      if (!acc[k].includes(c)) acc[k].push(c);
+    }
+  }
 }
 
 type Row =
@@ -45,7 +68,7 @@ export function Ladder({ call }: { call: CallInfo }) {
   const colOf = (ip: string) => cols.indexOf(ip);
   const centerPct = (i: number) => `${((i + 0.5) / n) * 100}%`;
 
-  // 消息行；rowBefore/rowAfter 记录每条消息的行下标，供标线/协商行锚定
+  // 消息行；rowBefore/rowAfter 记录每条消息的行下标，供标线/编码行锚定
   const rows: Row[] = [];
   const rowBefore: number[] = [];
   const rowAfter: number[] = [];
@@ -67,7 +90,7 @@ export function Ladder({ call }: { call: CallInfo }) {
 
   // 待插入行 {anchor, prio, row}：统一按锚点从大到小 splice（大锚点先插不会
   // 影响更小的锚点位置）。同锚点时 prio 大的先插、最终排在后面——FS 判定行
-  // 因此排在同位置的协商行之后
+  // 因此排在同位置的编码行之后
   const inserts: { anchor: number; prio: number; row: Row }[] = [];
   if (eStr)
     inserts.push({
@@ -81,59 +104,114 @@ export function Ladder({ call }: { call: CallInfo }) {
       prio: 0,
       row: { t: "marker", kind: "start", text: `RTP 媒体开始 ${sStr}` },
     });
-  // 通话实际用到的编码 chips（汇总字段 codecs）：跟在开始标线之后
-  {
-    const chips = codecChips(call.codecs || {});
-    if (chips.length)
-      inserts.push({
-        anchor: si + 1,
-        prio: 0,
-        row: { t: "chips", label: "实际编码", chips },
-      });
-  }
 
-  // 两腿协商编码：每条腿记住最后一条带编码名的 SDP 行下标（= 该腿应答行），
-  // 协商行锚在这行之后——即协商完成的时刻，不早于该腿的应答出现在图上
-  const legAnchors: Record<string, number> = {};
-  const sdpRows: number[] = [];
-  events.forEach((m, i) => {
-    if (m.sdpCodecs && (m.sdpCodecs.audio?.length || m.sdpCodecs.video?.length)) {
-      sdpRows.push(rowAfter[i]);
-      if (m.callId) legAnchors[m.callId] = rowAfter[i];
-    }
-  });
-  // 兜底锚点：第二条 SDP 行之后（即首个 offer/answer 对完成处），且不晚于开始标线
-  let ni = sdpRows.length >= 2 ? sdpRows[1] : sdpRows.length === 1 ? sdpRows[0] : si;
-  ni = Math.min(ni, si);
-
+  // ---- 编码协商展示：谁支持什么 / 最终定了什么 ----
   const npl = call.negotiatedPerLeg || {};
-  let legInserted = false;
-  for (const [key, name] of [
-    ["caller", "主叫"],
-    ["callee", "被叫"],
-  ] as const) {
-    const leg = npl[key];
-    if (!leg) continue;
-    const chips = codecChips(leg);
-    if (!chips.length) continue;
-    legInserted = true;
-    const label =
-      leg.answered === false ? `${name}候选编码（未收到应答）` : `${name}侧协商`;
-    const anchor =
-      leg.callId && legAnchors[leg.callId] != null
-        ? Math.min(legAnchors[leg.callId], si)
-        : ni;
-    inserts.push({ anchor, prio: 0, row: { t: "chips", label, chips } });
-  }
-  if (!legInserted) {
-    // 兜底：单行协商编码汇总（无 per-leg 数据时）
-    const chips = codecChips(call.negotiatedCodecs || {});
-    if (chips.length) {
-      const label =
-        call.sdpAnswered === false ? "主叫候选编码（未收到应答）" : "协商编码";
-      inserts.push({ anchor: ni, prio: 0, row: { t: "chips", label, chips } });
+  const callerLegId = npl.caller?.callId ?? null;
+  const calleeLegId = npl.callee?.callId ?? null;
+  // 每条腿的 offer 发送方 = 该腿首条带 SDP 消息的发送方
+  const legOfferer: Record<string, string> = {};
+  for (const m of events) {
+    if (m.sdpCodecs && m.callId && !(m.callId in legOfferer)) {
+      legOfferer[m.callId] = m.src;
     }
   }
+
+  // 各方在 SDP 里宣告的编码（有序去重）+ 首次宣告的消息下标（供锚定）。
+  // FS 按腿拆开：对主叫是应答、对被叫是新的 offer，两条腿宣告的编码可能不同，
+  // 合并成一行会掩盖差异。
+  const supported: Record<Party, { codecs: { audio: string[]; video: string[] }; firstIdx: number }> = {
+    caller: { codecs: { audio: [], video: [] }, firstIdx: -1 },
+    fsCaller: { codecs: { audio: [], video: [] }, firstIdx: -1 },
+    fsCallee: { codecs: { audio: [], video: [] }, firstIdx: -1 },
+    callee: { codecs: { audio: [], video: [] }, firstIdx: -1 },
+  };
+  events.forEach((m, i) => {
+    if (!m.sdpCodecs || !(m.sdpCodecs.audio?.length || m.sdpCodecs.video?.length)) return;
+    let party: Party | null = null;
+    if (m.callId && m.callId === callerLegId) {
+      // 主叫腿：offer 方 = 主叫，answer 方 = FS
+      party = m.src === legOfferer[m.callId] ? "caller" : "fsCaller";
+    } else if (m.callId && m.callId === calleeLegId) {
+      // 被叫腿：offer 方 = FS，answer 方 = 被叫
+      party = m.src === legOfferer[m.callId] ? "fsCallee" : "callee";
+    }
+    if (!party) return;
+    mergeCodecs(supported[party].codecs, m.sdpCodecs);
+    if (supported[party].firstIdx === -1) supported[party].firstIdx = i;
+  });
+  // 各方支持编码行：锚在该方向首次宣告 SDP 的消息行之后
+  for (const party of ["caller", "fsCaller", "fsCallee", "callee"] as const) {
+    const s = supported[party];
+    if (!(s.codecs.audio.length || s.codecs.video.length)) continue;
+    const chips = codecChips(s.codecs);
+    inserts.push({
+      anchor: Math.min(rowAfter[s.firstIdx], si),
+      prio: 0,
+      row: { t: "chips", label: `${PARTY_NAMES[party]}的编码`, chips },
+    });
+  }
+
+  // 最终协商编码：两腿应答合并（negotiatedPerLeg）；无按腿数据时回退
+  // negotiatedCodecs 汇总。answered=false 表示只抓到 offer、没有应答。
+  {
+    const legs: NegotiatedLeg[] = [npl.caller, npl.callee].filter(Boolean) as NegotiatedLeg[];
+    if (legs.length >= 2) {
+      const same =
+        legs[0].audio.join("\u0000") === legs[1].audio.join("\u0000") &&
+        legs[0].video.join("\u0000") === legs[1].video.join("\u0000");
+      if (same) {
+        const chips = codecChips(legs[0]);
+        if (chips.length)
+          inserts.push({ anchor: si, prio: 0, row: { t: "chips", label: "最终协商", chips } });
+      } else {
+        // 两腿协商结果不同（FS 转码场景）：分腿列出
+        const chips: Chip[] = [];
+        for (const [leg, name] of [
+          [legs[0], "主叫腿"],
+          [legs[1], "被叫腿"],
+        ] as [NegotiatedLeg, string][]) {
+          for (const c of codecChips(leg)) {
+            chips.push({ icon: c.icon, text: `${name} ${c.text}` });
+          }
+        }
+        if (chips.length)
+          inserts.push({
+            anchor: si,
+            prio: 0,
+            row: { t: "chips", label: "最终协商（两腿不同）", chips },
+          });
+      }
+    } else if (legs.length === 1) {
+      const leg = legs[0];
+      const chips = codecChips(leg);
+      if (chips.length)
+        inserts.push({
+          anchor: si,
+          prio: 0,
+          row: {
+            t: "chips",
+            label: leg.answered ? "最终协商" : "候选编码（未收到应答）",
+            chips,
+          },
+        });
+    } else {
+      // 兜底：旧数据只有汇总字段
+      const chips = codecChips(call.negotiatedCodecs || {});
+      if (chips.length) {
+        inserts.push({
+          anchor: si,
+          prio: 0,
+          row: {
+            t: "chips",
+            label: call.sdpAnswered === false ? "主叫候选编码（未收到应答）" : "协商编码",
+            chips,
+          },
+        });
+      }
+    }
+  }
+
   // FS 是否参与编解码（对比两腿协商编码 + 媒体路径判定）：固定在 RTP 开始标线之前
   const fm = call.fsMedia;
   if (fm && fm.verdict) {
@@ -243,6 +321,11 @@ export function Ladder({ call }: { call: CallInfo }) {
           );
         })}
       </div>
+      <p className="muted small" style={{ margin: "8px 0 0" }}>
+        注：各方「编码」取自本通话 SDP 中实际宣告的内容——主叫为 INVITE offer，FS
+        按腿拆分（对主叫的应答 / 对被叫的新 offer，两边可能不同），被叫为 200 OK
+        应答；FS 的完整编码能力由其配置决定，抓包中不可见。
+      </p>
     </div>
   );
 }
