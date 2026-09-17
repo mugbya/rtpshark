@@ -12,9 +12,11 @@
   "app": {
     "windows": [
       {
-        "title": "rtpshark",
-        "width": 800,
-        "height": 600
+        "title": "RTPShark · RTP 音视频流分析",
+        "width": 1280,
+        "height": 860,
+        "minWidth": 960,
+        "minHeight": 640
       }
     ],
     "security": {
